@@ -1,0 +1,20 @@
+# Build & package artifacts
+build/
+dist/
+dl/
+CPC4PS3-GitHub/
+*.elf
+*.self
+*.pkg
+*.log
+final_status.txt
+
+# Compiled objects & libraries (preserve required PSL1GHT render object)
+*.o
+!src/ps3/prebuilt/SDL_PSL1GHTrender.o
+*.a
+*.d
+
+# OS / editor metadata
+.DS_Store
+Thumbs.db

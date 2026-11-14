@@ -1,0 +1,584 @@
+#include "asic.h"
+#include "log.h"
+#include "cap32.h"
+#include "SDL.h"
+#include "crtc.h"
+#include "z80.h"
+
+byte *pbRegisterPage;
+extern SDL_Color colours[32];
+extern t_z80regs z80;
+extern t_GateArray GateArray;
+extern t_CRTC CRTC;
+extern t_CPC CPC;
+extern t_PSG PSG;
+extern SDL_Surface *back_surface;
+extern dword dwXScale;
+extern byte *membank_config[8][4];
+extern byte *membank_write[4];
+
+asic_t asic;
+
+struct asic_color_t {
+  double r;
+  double g;
+  double b;
+  bool set;
+};
+
+asic_color_t asic_colours[32];
+
+static const word dcsr_addr = 0x6C0F;
+
+inline void asic_reset_dma_channel(int c) {
+  asic.dma.ch[c].source_address = 0;
+  asic.dma.ch[c].loop_address = 0;
+  asic.dma.ch[c].prescaler = 0;
+  asic.dma.ch[c].enabled = false;
+  asic.dma.ch[c].int_pending = false;
+  asic.dma.ch[c].pause_ticks = 0;
+  asic.dma.ch[c].tick_cycles = 0;
+  asic.dma.ch[c].loops = 0;
+}
+
+void asic_reset() {
+  asic.locked = true;
+  asic.lockSeqPos = 0;
+
+  asic.extend_border = false;
+  asic.hscroll = 0;
+  asic.vscroll = 0;
+
+  for(int i = 0; i < 16; i++) {
+    asic.sprites_x[i] = asic.sprites_y[i] = asic.sprites_mag_x[i] = asic.sprites_mag_y[i] = 0;
+    for(int j = 0; j < 16; j++) {
+      for(int k = 0; k < 16; k++) {
+        asic.sprites[i][j][k] = 0;
+      }
+    }
+  }
+
+  asic.raster_int_pending = false;
+  asic.interrupt_vector = 1;
+
+  for(int c = 0; c < NB_DMA_CHANNELS; c++) {
+    asic_reset_dma_channel(c);
+  }
+}
+
+void asic_poke_lock_sequence(byte val) {
+   static constexpr byte lockSeq[] = { 0x00, 0x00, 0xff, 0x77, 0xb3, 0x51, 0xa8, 0xd4, 0x62, 0x39, 0x9c, 0x46, 0x2b, 0x15, 0x8a, 0xcd };
+   static constexpr int lockSeqLength = sizeof(lockSeq)/sizeof(lockSeq[0]);
+   LOG_DEBUG("ASIC poked with val=" << std::hex << static_cast<int>(val) << std::dec << " lockPos = " << asic.lockSeqPos);
+   // Lock sequence can only start after a non zero value
+   if (asic.lockSeqPos == 0) {
+      if (val > 0) {
+         asic.lockSeqPos = 1;
+      }
+   } else {
+      if(asic.lockSeqPos < lockSeqLength) {
+         if (val == lockSeq[asic.lockSeqPos]) {
+            asic.lockSeqPos++;
+         } else {
+            asic.lockSeqPos++;
+            // If the lock sequence is matched except for the last byte, it means lock
+            if (asic.lockSeqPos == lockSeqLength) {
+               LOG_DEBUG("ASIC locked");
+               asic.locked = true;
+            }
+            if (val == 0) {
+              // We're now waiting for 0xFF
+              asic.lockSeqPos = 2;
+            } else {
+               // We had a non 0, we're now waiting for 0
+               asic.lockSeqPos = 1;
+            }
+         }
+      } else {
+         // Full sequence matched and an additional value was written, it means unlock
+         if (asic.lockSeqPos == lockSeqLength) {
+            LOG_DEBUG("ASIC unlocked");
+            asic.locked = false;
+            asic.lockSeqPos = (val == 0) ? 0 : 1;
+         }
+      }
+   }
+}
+
+static inline unsigned short decode_magnification(byte val) {
+   byte mag = (val & 0x3);
+   if (mag == 3) mag = 4;
+   return mag;
+}
+
+byte asic_read_dcsr() {
+  return *(membank_write[dcsr_addr >> 14] + (dcsr_addr & 0x3fff));
+}
+
+byte asic_compute_dcsr() {
+  byte dcsr = asic_read_dcsr();
+  for (int c = 0; c < NB_DMA_CHANNELS; c++) {
+    if (asic.dma.ch[c].enabled) {
+      dcsr |= (0x1 << c);
+    } else {
+      dcsr &= ~(0x1 << c);
+    }
+    if (asic.dma.ch[c].int_pending) {
+      dcsr |= (0x40 >> c);
+    } else {
+      dcsr &= ~(0x40 >> c);
+    }
+  }
+  return dcsr;
+}
+
+void asic_update_dcsr(byte val) {
+  // Write back the DCSR value over all DMA registers.
+  // Because the ASIC only decodes the upper address bits when reading from
+  // the DMA register block (&6c00–&6c0f), reading any address in &6c00–&6c0f
+  // returns the value of DCSR (&6c0f).
+  // Writing the DCSR at all these addresses rather than handling this special
+  // case on the read path allows for faster reads.
+  for (auto addr = dcsr_addr & 0xfff0; addr <= dcsr_addr; addr++) {
+    *(membank_write[addr >> 14] + (addr & 0x3fff)) = val;
+  }
+}
+
+void asic_dma_cycle() {
+  // Use the DMA info to feed PSG from RAM:
+  // Read one 16bits instruction for each enabled channel X at each scan line and execute it.
+  // More precisely: after leading edge of HSYNC, one dead cycle followed by a fetch cycle for each active channel (enabled and not executing a pause) followed by an execution cycle for each active channel.
+  // All instructions last 1 cycle except LOAD that lasts 8 (up to 10 if CPU is also accessing the PSG).
+  //  - LOAD R,DD will write DD to PSG.RegisterAY.Index[R] - The ASIC should actually be blocking the CPU if it tries to access the PSG, to determine if it's important to emulate.
+  //  - PAUSE N set a counter to wait N*(chX.prescaler+1) cycles
+  //  - REPEAT NNN keep address of loop start (next instruction) and a counter of loops
+  //  - NOP does nothing
+  //  - LOOP jump to address of loop stat if counter of loops is >0 and decrement it (yes, code is actually executed NNN+1 times)
+  //  - INT generates an interruption for chX by setting chX.int_pending to true (code for CPU to detect it must also be done !)
+  //  - STOP set chX.enabled to false ? (still increment address for when processing will restart)
+  //  The last 4 can be OR-ed to be combined
+
+  byte dcsr = asic_read_dcsr();
+  bool dcsr_changed = false;
+  for(int c = 0; c < NB_DMA_CHANNELS; c++) {
+    dma_channel &channel = asic.dma.ch[c];
+    if(!channel.enabled) continue;
+    if(channel.pause_ticks > 0) { // PAUSE on-going
+      if(channel.tick_cycles < channel.prescaler) {
+        channel.tick_cycles++;
+        continue;
+      }
+      channel.tick_cycles = 0;
+      channel.pause_ticks--;
+      continue;
+    }
+    int bank = ((channel.source_address & 0xC000) >> 14);
+    int addr = (channel.source_address & 0x3FFF);
+    word instruction = 0;
+    instruction |= membank_config[GateArray.RAM_config & 7][bank][addr];
+    instruction |= membank_config[GateArray.RAM_config & 7][bank][addr+1] << 8;
+    LOG_DEBUG("DMA [" << c << "] instruction " << std::hex << instruction << " from " << channel.source_address << std::dec);
+    int opcode = ((instruction & 0x7000) >> 12);
+    if (opcode == 0) { // LOAD
+      int R = ((instruction & 0x0F00) >> 8);
+      byte val = (instruction & 0x00FF);
+      SetAYRegister(R, val);
+      LOG_DEBUG("DMA [" << c << "] load " << std::hex << static_cast<int>(val) << " in register " << R << std::dec);
+    }
+    else {
+      if (opcode & 0x01) { // PAUSE
+        // Tried with -1 here as we want to delay for exactly N scanlines, and current code suggests we'll pause for N+1 scanlines, but this sounds wrong on Burnin' Rubber.
+        channel.pause_ticks = (instruction) & 0x0FFF;
+        channel.tick_cycles = 0;
+        LOG_DEBUG("DMA [" << c << "] pause " << channel.pause_ticks << "*" << static_cast<int>(channel.prescaler) << " cycles");
+      }
+      if (opcode & 0x02) { // REPEAT
+        channel.loops = (instruction) & 0x0FFF;
+        channel.loop_address = channel.source_address;
+        LOG_DEBUG("DMA [" << c << "] repeat " << channel.loops);
+      }
+      if (opcode & 0x04) { // NOP, LOOP, INT, STOP
+        if(instruction & 0x0001) { // LOOP
+          if(channel.loops > 0) {
+            channel.source_address = channel.loop_address;
+            LOG_DEBUG("DMA [" << c << "] loop");
+          }
+        }
+        if(instruction & 0x0010) { // INT
+          LOG_DEBUG("DMA [" << c << "] interrupt for channel " << c);
+          channel.int_pending = true;
+          z80.int_pending = 1;
+        }
+        if(instruction & 0x0020) { // STOP
+          channel.enabled = false;
+          LOG_DEBUG("DMA [" << c << "] stop");
+        }
+      }
+    }
+    channel.source_address += 2;
+    {
+      if (channel.enabled) {
+        dcsr |= (0x1 << c);
+        dcsr_changed = true;
+      } else {
+        dcsr &= ~(0x1 << c);
+        dcsr_changed = true;
+      }
+      if (channel.int_pending) {
+        dcsr |= (0x40 >> c);
+        dcsr_changed = true;
+      }
+    }
+  }
+  // Run RAM test of testplus.cpr when touching this (this is not a guarantee that this is correct but at least it's a guarantee that it's less wrong ! cf issue #40)
+  if (dcsr_changed)
+  {
+    asic_update_dcsr(dcsr);
+  }
+}
+
+byte asic_get_interrupt_vector() {
+  if (asic.locked) {
+    return 0xff;
+  }
+
+  bool more_pending = false;
+  byte return_value = 0;
+  // Priority of interrupts are: PRI, DMA2, DMA1, DMA0.
+  // Their source IDs are respectively 6, 0, 2, and 4.
+  if (asic.raster_int_pending) {
+      return_value = (asic.interrupt_vector & 0xF8) | 6;
+      // Clear the interrupt automatically if bit 0 of the interrupt vector is 0
+      if ((asic.interrupt_vector & 1) == 0) {
+        asic.raster_int_pending = false;
+      }
+  }
+  int source_id = 0;
+  for (int c = NB_DMA_CHANNELS-1; c >= 0; c--) {
+    if (asic.dma.ch[c].int_pending) {
+      if (return_value) {
+        more_pending = true;
+      } else {
+        return_value = (asic.interrupt_vector & 0xF8) | source_id;
+        // Clear the interrupt automatically if bit 0 of the interrupt vector is 0
+        if ((asic.interrupt_vector & 1) == 0) {
+          asic.dma.ch[c].int_pending = false;
+        }
+      }
+    }
+    source_id += 2;
+  }
+  if (!return_value) {
+    LOG_WARNING("asic_get_interrupt_vector called but no pending interrupt!");
+    return_value = (asic.interrupt_vector & 0xF8) | 6;
+  }
+  if (more_pending) {
+    z80.int_pending = true;
+  }
+  asic_update_dcsr(asic_compute_dcsr());
+  return return_value;
+}
+
+void asic_set_palette() {
+  for (int colour = 0; colour < 32; colour++) {
+    if (!asic_colours[colour].set) {
+      continue;
+    }
+    // TODO: deduplicate with code in video_set_palette + make it work in monochrome
+    dword red = static_cast<dword>(asic_colours[colour].r * (CPC.scr_intensity / 10.0) * 255);
+    if (red > 255) { // limit to the maximum
+      red = 255;
+    }
+    dword green = static_cast<dword>(asic_colours[colour].g * (CPC.scr_intensity / 10.0) * 255);
+    if (green > 255) {
+      green = 255;
+    }
+    dword blue = static_cast<dword>(asic_colours[colour].b * (CPC.scr_intensity / 10.0) * 255);
+    if (blue > 255) {
+      blue = 255;
+    }
+    GateArray.palette[colour] = SDL_MapRGB(back_surface->format, red, green, blue);
+    // TODO(cpitrat): Confirm whether we should update the mode 2 'anti-aliasing' colour (cf. src/cap32.cpp where GateArray.palette[33] is set).
+  }
+}
+
+// Return true if byte should be written in memory
+bool asic_register_page_write(word addr, byte val) {
+   if (addr < 0x4000 || addr > 0x7FFF) {
+      return true;
+   }
+   LOG_DEBUG("ASIC register page write: addr=" << std::hex << addr << ", val=" << static_cast<int>(val) << std::dec);
+   // TODO:double check the writes (more cases with mirroring / write only ?)
+   if (addr >= 0x4000 && addr < 0x5000) {
+      int id = ((addr & 0xF00) >> 8);
+      int y = ((addr & 0xF0) >> 4);
+      int x = (addr & 0xF);
+      byte color = (val & 0xF);
+      pbRegisterPage[(addr & 0x3FFF)] = color;
+      if(color > 0) {
+         color += 16;
+      }
+      asic.sprites[id][x][y] = color;
+      //LOG_DEBUG("Received sprite data for sprite " << id << ": x=" << x << ", y=" << y << ", color=" << static_cast<int>(val));
+      return false;
+   } else if (addr >= 0x6000 && addr < 0x6080) {
+      int id = ((addr - 0x6000) >> 3);
+      int type = (addr & 0x7);
+      switch (type) {
+         // From Arnold V5 specs:
+         // Data written to these registers should be between +767 and -256 for X, and between +255 and -256 for Y.
+         // With standard 6845 timing (64us scan lines, 200 visible lines), "on screen" positions at maximum sprite magnification are -64 to +639 in x and -63 to +199 in y.
+         // A sprite will not be displayed if either the vertical or the horizontal positions outside the on screen range.
+         case 0:
+            // X position
+            {
+               uint16_t x = (static_cast<uint16_t>(asic.sprites_x[id]) & 0xFF00) | val;
+               x &= 0x03FF;
+               if (x > 767) x |= 0xFC00; // Sign-extend bit 10
+               asic.sprites_x[id] = static_cast<int16_t>(x);
+            }
+            LOG_DEBUG("Received sprite X (LSB=" << static_cast<uint16_t>(val) << ") for sprite " << id << " x=" << asic.sprites_x[id]);
+            // Mirrored in RAM image 4 bytes after
+            pbRegisterPage[(addr & 0x3FFF) + 4] = val;
+            break;
+         case 1:
+            // X position
+            {
+               uint16_t x = (static_cast<uint16_t>(asic.sprites_x[id]) & 0x00FF) | (val << 8);
+               x &= 0x03FF;
+               if (x > 767) x |= 0xFC00; // Sign-extend bit 10
+               asic.sprites_x[id] = static_cast<int16_t>(x);
+
+               // Sign-extended high byte written to ASIC registers.
+               pbRegisterPage[(addr & 0x3FFF)] = static_cast<byte>(x >> 8);
+               // Mirrored in RAM image 4 bytes after
+               pbRegisterPage[(addr & 0x3FFF) + 4] = static_cast<byte>(x >> 8);
+            }
+            LOG_DEBUG("Received sprite X (MSB=" << static_cast<uint16_t>(val) << ") for sprite " << id << " x=" << asic.sprites_x[id]);
+            // We handled writing the sign-extended value.
+            return false;
+         case 2:
+            // Y position
+            {
+               uint16_t y = (static_cast<uint16_t>(asic.sprites_y[id]) & 0xFF00) | val;
+               y &= 0x01FF;
+               if (y > 255) y |= 0xFE00; // Sign-extend bit 8
+               asic.sprites_y[id] = static_cast<int16_t>(y);
+            }
+            LOG_DEBUG("Received sprite Y (LSB=" << static_cast<uint16_t>(val) << ") for sprite " << id << " y=" << asic.sprites_y[id]);
+            // Mirrored in RAM image 4 bytes after
+            pbRegisterPage[(addr & 0x3FFF) + 4] = val;
+            break;
+         case 3:
+            // Y position
+            {
+               uint16_t y = (static_cast<uint16_t>(asic.sprites_y[id]) & 0x00FF) | (val << 8);
+               y &= 0x01FF;
+               if (y > 255) y |= 0xFE00; // Sign-extend bit 8
+               asic.sprites_y[id] = static_cast<int16_t>(y);
+
+               // Sign-extended high byte written to ASIC registers.
+               pbRegisterPage[(addr & 0x3FFF)] = static_cast<byte>(y >> 8);
+               // Mirrored in RAM image 4 bytes after
+               pbRegisterPage[(addr & 0x3FFF) + 4] = val;
+            }
+            LOG_DEBUG("Received sprite Y (MSB=" << static_cast<uint16_t>(val) << ") for sprite " << id << " y=" << asic.sprites_y[id]);
+            // We handled writing the sign-extended value.
+            return false;
+         case 4:
+            // Magnification
+            asic.sprites_mag_x[id] = decode_magnification(val >> 2);
+            asic.sprites_mag_y[id] = decode_magnification(val);
+            LOG_DEBUG("Received sprite magnification for sprite " << id << " mx=" << asic.sprites_mag_x[id] << ", my=" << asic.sprites_mag_y[id]);
+            // Write-only: does not affect pbRegisterPage
+            return false;
+         default:
+            // This is only a LOG_DEBUG because this happens on Burnin' Rubber which is likely
+            // copying a whole memory area rather than only meaningful bytes.
+            LOG_DEBUG("Received sprite operation of unsupported type: " << type << " addr=" << std::hex << addr << " - val=" << static_cast<int>(val) << std::dec);
+            return false;
+      }
+   } else if (addr >= 0x6400 && addr < 0x6440) {
+      int colour = (addr & 0x3F) >> 1;
+      if ((addr % 2) == 1) {
+         double green = static_cast<double>(val & 0x0F)/16;
+         //LOG_DEBUG("Received color operation: color " << colour << " has green = " << green);
+         asic_colours[colour].g = green;
+         pbRegisterPage[(addr & 0x3FFF)] = (val & 0x0F);
+         // TODO: find a cleaner way to do this - this is a copy paste from "Set ink value" in cap32.cpp
+      } else {
+         double red   = static_cast<double>((val & 0xF0) >> 4)/16;
+         double blue  = static_cast<double>(val & 0x0F)/16;
+         //LOG_DEBUG("Received color operation: color " << colour << " has red = " << red << " and blue = " << blue);
+         asic_colours[colour].r = red;
+         asic_colours[colour].b = blue;
+         pbRegisterPage[(addr & 0x3FFF)] = val;
+      }
+      asic_colours[colour].set = true;
+      // TODO(cpitrat): We don't need to set all colours, only colour.
+      asic_set_palette();
+      return false;
+   } else if (addr >= 0x6800 && addr < 0x6806) {
+      if (addr == 0x6800) {
+         LOG_DEBUG("Received programmable raster interrupt scan line: " << static_cast<int>(val));
+         CRTC.interrupt_sl = val;
+      } else if (addr == 0x6801) {
+         LOG_DEBUG("Received scan line for split: " << static_cast<int>(val));
+         CRTC.split_sl = val;
+         // TODO(cpitrat): Clarify whether this is needed or not.
+         // This shouldn't be and it doesn't seem to have any effect in practice.
+         //CRTC.sl_count = 0;
+      } else if (addr == 0x6802) {
+         CRTC.split_addr &= 0x00FF;
+         CRTC.split_addr |= (val << 8);
+         LOG_DEBUG("Received address for split: " << std::hex << CRTC.split_addr << std::dec);
+      } else if (addr == 0x6803) {
+         CRTC.split_addr &= 0x3F00;
+         CRTC.split_addr |= val;
+         LOG_DEBUG("Received address for split: " << std::hex << CRTC.split_addr << std::dec);
+      } else if (addr == 0x6804) {
+         asic.hscroll = (val & 0xf);
+         asic.vscroll = ((val >> 4) & 0x7);
+         asic.extend_border = (val >> 7);
+         LOG_DEBUG("Received soft scroll control: " << static_cast<int>(val) << ": dx=" << asic.hscroll << ", dy=" << asic.vscroll << ", border=" << asic.extend_border);
+         update_skew();
+      } else if (addr == 0x6805) {
+         LOG_DEBUG("Received interrupt vector: " << static_cast<int>(val));
+         // Keep bits 3-7 (base vector) and bit 0 (auto-clear control)
+         asic.interrupt_vector = val & 0xF9;
+      }
+   } else if (addr >= 0x6808 && addr < 0x6810) {
+     LOG_WARNING("[UNSUPPORTED] Received analog input stuff");
+   } else if (addr >= 0x6C00 && addr < 0x6C0B) {
+     int c = ((addr & 0xc) >> 2);
+     LOG_DEBUG("Received DMA source address: " << std::hex << addr << " (channel " << c << ") " << static_cast<int>(val) << std::dec);
+     dma_channel *channel = nullptr;
+     channel = &asic.dma.ch[c];
+     switch(addr & 0x3) {
+       case 0:
+         channel->source_address &= 0xFF00;
+         // least significant bit is ignored (address are word-aligned)
+         channel->source_address |= (val & 0xFE);
+         break;
+       case 1:
+         channel->source_address &= 0x00FF;
+         channel->source_address |= (val << 8);
+         break;
+       case 2:
+         channel->prescaler = val;
+         break;
+       default:
+         // unused
+         break;
+     }
+   } else if (addr == 0x6C0F) {
+      LOG_DEBUG("Received DMA control register: " << std::hex << static_cast<int>(val) << std::dec);
+      // TODO: Factorize DCSR maintenance logic by using asic_compute_dcsr here.
+      byte dcsr = asic_read_dcsr();
+      for (int c = 0; c < NB_DMA_CHANNELS; c++) {
+        asic.dma.ch[c].enabled = (val & (0x1 << c));
+        if (asic.dma.ch[c].enabled) {
+          dcsr |= (0x1 << c);
+        } else {
+          dcsr &= ~(0x1 << c);
+          asic_reset_dma_channel(c);
+        }
+        if (val & (0x40 >> c)) {
+          asic.dma.ch[c].int_pending = false;
+          dcsr &= ~(0x40 >> c);
+          LOG_INFO("DMA [" << c << "] clearing interrupt for channel " << c);
+        }
+        LOG_DEBUG("DMA channel " << c << (asic.dma.ch[c].enabled ? " enabled" : " disabled"))
+      }
+      asic_update_dcsr(dcsr);
+      return false;
+   } else {
+      LOG_DEBUG("Received unused write at " << std::hex << addr << " - val: " << static_cast<int>(val) << std::dec);
+   }
+   return true;
+}
+
+static inline void putpixel(SDL_Surface *surface, int x, int y, uint32_t pixel)
+{
+   int bpp = surface->format->BytesPerPixel;
+   /* Here p is the address to the pixel we want to set */
+   uint8_t *p = static_cast<uint8_t *>(surface->pixels) + y * surface->pitch + x * bpp;
+
+   switch(bpp) {
+      case 1:
+         *p = pixel;
+         break;
+
+      case 2:
+         *reinterpret_cast<uint16_t *>(p) = pixel;
+         break;
+
+      case 3:
+         if(SDL_BYTEORDER == SDL_BIG_ENDIAN) {
+            p[0] = (pixel >> 16) & 0xff;
+            p[1] = (pixel >> 8) & 0xff;
+            p[2] = pixel & 0xff;
+         } else {
+            p[0] = pixel & 0xff;
+            p[1] = (pixel >> 8) & 0xff;
+            p[2] = (pixel >> 16) & 0xff;
+         }
+         break;
+
+      case 4:
+         *reinterpret_cast<uint32_t *>(p) = pixel;
+         break;
+   }
+}
+
+// TODO: all this could be replaced by pre-computed SDL sprites
+void asic_draw_sprites() {
+   // TODO: this should be affected by other CRTC.registers (reg2 for borderWidth ?, reg1 for screenWidth ? reg6 for screenHeight ?)
+   const int borderWidth = 64 + (asic.extend_border ? 16 : 0);
+   const int borderHeight = 40 + 8*(30 - CRTC.registers[7]);
+   const int screenWidth = 640 + borderWidth;
+   const int screenHeight = 200 + borderHeight;
+   // For each sprite
+   for(int i = 15; i >= 0; i--) {
+      int sx = asic.sprites_x[i];
+      int mx = asic.sprites_mag_x[i];
+      // If some part of the sprite is visible (horizontal check)
+      if(mx > 0 && (sx + 64*mx) >= borderWidth && sx <= screenWidth) {
+         int sy = asic.sprites_y[i];
+         int my = asic.sprites_mag_y[i];
+         // If some part of the sprite is visible (vertical check)
+         if(my > 0 && (sy + 64*my) >= borderHeight && sy <= screenHeight) {
+            sx += borderWidth;
+            sy += borderHeight;
+            // For each column of the sprite
+            for(int x = 0; x < 16; x++) {
+               if(sx + (x*mx) <= borderWidth) {
+                  continue;
+               }
+               if(sx + (x*mx) >= screenWidth) {
+                  break;
+               }
+               // For each line of the sprite
+               for(int y = 0; y < 16; y++) {
+                  if(sy + (y*my) <= borderHeight) {
+                     continue;
+                  }
+                  if(sy + (y*my) >= screenHeight) {
+                     break;
+                  }
+                  // Draw pixel
+                  byte p = asic.sprites[i][x][y];
+                  if(p) {
+                     uint32_t pixel = GateArray.palette[p];
+                     for(int dx = 0; dx < mx; dx++) {
+                        for(int dy = 0; dy < my * static_cast<int>(dwXScale); dy++) {
+                           putpixel(back_surface, (sx+(x*mx)+dx) * dwXScale / 2, (sy+(y*my)) * dwXScale + dy, pixel);
+                        }
+                     }
+                  }
+               }
+            }
+         }
+      }
+   }
+}
